@@ -78,6 +78,7 @@ import { SSEBroadcaster } from './worker/SSEBroadcaster.js';
 import { SDKAgent } from './worker/SDKAgent.js';
 import { GeminiAgent, isGeminiSelected, isGeminiAvailable } from './worker/GeminiAgent.js';
 import { OpenRouterAgent, isOpenRouterSelected, isOpenRouterAvailable } from './worker/OpenRouterAgent.js';
+import { OpenAICompatibleAgent, isCustomProviderSelected, isCustomProviderAvailable } from './worker/OpenAICompatibleAgent.js';
 import { PaginationHelper } from './worker/PaginationHelper.js';
 import { SettingsManager } from './worker/SettingsManager.js';
 import { SearchManager } from './worker/SearchManager.js';
@@ -146,6 +147,7 @@ export class WorkerService {
   private sdkAgent: SDKAgent;
   private geminiAgent: GeminiAgent;
   private openRouterAgent: OpenRouterAgent;
+  private customAgent: OpenAICompatibleAgent;
   private paginationHelper: PaginationHelper;
   private settingsManager: SettingsManager;
   private sessionEventBroadcaster: SessionEventBroadcaster;
@@ -191,6 +193,7 @@ export class WorkerService {
     this.sdkAgent = new SDKAgent(this.dbManager, this.sessionManager);
     this.geminiAgent = new GeminiAgent(this.dbManager, this.sessionManager);
     this.openRouterAgent = new OpenRouterAgent(this.dbManager, this.sessionManager);
+    this.customAgent = new OpenAICompatibleAgent(this.dbManager, this.sessionManager);
 
     this.paginationHelper = new PaginationHelper(this.dbManager);
     this.settingsManager = new SettingsManager(this.dbManager);
@@ -219,7 +222,8 @@ export class WorkerService {
       workerPath: __filename,
       getAiStatus: () => {
         let provider = 'claude';
-        if (isOpenRouterSelected() && isOpenRouterAvailable()) provider = 'openrouter';
+        if (isCustomProviderSelected() && isCustomProviderAvailable()) provider = 'custom';
+        else if (isOpenRouterSelected() && isOpenRouterAvailable()) provider = 'openrouter';
         else if (isGeminiSelected() && isGeminiAvailable()) provider = 'gemini';
         return {
           provider,
@@ -297,7 +301,7 @@ export class WorkerService {
 
     // Standard routes (registered AFTER guard middleware)
     this.server.registerRoutes(new ViewerRoutes(this.sseBroadcaster, this.dbManager, this.sessionManager));
-    this.server.registerRoutes(new SessionRoutes(this.sessionManager, this.dbManager, this.sdkAgent, this.geminiAgent, this.openRouterAgent, this.sessionEventBroadcaster, this));
+    this.server.registerRoutes(new SessionRoutes(this.sessionManager, this.dbManager, this.sdkAgent, this.geminiAgent, this.openRouterAgent, this.customAgent, this.sessionEventBroadcaster, this));
     this.server.registerRoutes(new DataRoutes(this.paginationHelper, this.dbManager, this.sessionManager, this.sseBroadcaster, this, this.startTime));
     this.server.registerRoutes(new SettingsRoutes(this.settingsManager));
     this.server.registerRoutes(new LogsRoutes());
@@ -572,7 +576,10 @@ export class WorkerService {
    * Get the appropriate agent based on provider settings.
    * Same logic as SessionRoutes.getActiveAgent() for consistency.
    */
-  private getActiveAgent(): SDKAgent | GeminiAgent | OpenRouterAgent {
+  private getActiveAgent(): SDKAgent | GeminiAgent | OpenRouterAgent | OpenAICompatibleAgent {
+    if (isCustomProviderSelected() && isCustomProviderAvailable()) {
+      return this.customAgent;
+    }
     if (isOpenRouterSelected() && isOpenRouterAvailable()) {
       return this.openRouterAgent;
     }
@@ -817,7 +824,19 @@ export class WorkerService {
         await this.openRouterAgent.startSession(session, this);
         return;
       } catch (e) {
-        logger.warn('SDK', 'Fallback OpenRouter failed', {
+        logger.warn('SDK', 'Fallback OpenRouter failed, trying custom provider', {
+          sessionId: sessionDbId,
+          error: e instanceof Error ? e.message : String(e)
+        });
+      }
+    }
+
+    if (isCustomProviderAvailable()) {
+      try {
+        await this.customAgent.startSession(session, this);
+        return;
+      } catch (e) {
+        logger.warn('SDK', 'Fallback custom provider failed', {
           sessionId: sessionDbId,
           error: e instanceof Error ? e.message : String(e)
         });

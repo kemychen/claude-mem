@@ -57,13 +57,20 @@ export class SessionEventBroadcaster {
    * Updates processing status to reflect new queue depth
    */
   broadcastObservationQueued(sessionDbId: number): void {
-    this.sseBroadcaster.broadcast({
-      type: 'observation_queued',
-      sessionDbId
-    });
+    try {
+      this.sseBroadcaster?.broadcast?.({
+        type: 'observation_queued',
+        sessionDbId
+      } as any);
+    } catch (error) {
+      logger.warn('SSE', 'broadcastObservationQueued degraded to status-only mode', { sessionDbId }, error as Error);
+    }
 
-    // Update processing status (queue depth changed)
-    this.workerService.broadcastProcessingStatus();
+    try {
+      (this.workerService as any)?.broadcastProcessingStatus?.();
+    } catch (error) {
+      logger.warn('SSE', 'broadcastProcessingStatus failed during observation queue broadcast', { sessionDbId }, error as Error);
+    }
   }
 
   /**
@@ -71,14 +78,21 @@ export class SessionEventBroadcaster {
    * Updates processing status to reflect session removal
    */
   broadcastSessionCompleted(sessionDbId: number): void {
-    this.sseBroadcaster.broadcast({
-      type: 'session_completed',
-      timestamp: Date.now(),
-      sessionDbId
-    });
+    try {
+      this.sseBroadcaster?.broadcast?.({
+        type: 'session_completed',
+        timestamp: Date.now(),
+        sessionDbId
+      } as any);
+    } catch (error) {
+      logger.warn('SSE', 'broadcastSessionCompleted degraded to status-only mode', { sessionDbId }, error as Error);
+    }
 
-    // Update processing status (session removed from queue)
-    this.workerService.broadcastProcessingStatus();
+    try {
+      (this.workerService as any)?.broadcastProcessingStatus?.();
+    } catch (error) {
+      logger.warn('SSE', 'broadcastProcessingStatus failed during session completed broadcast', { sessionDbId }, error as Error);
+    }
   }
 
   /**
@@ -86,7 +100,10 @@ export class SessionEventBroadcaster {
    * Updates processing status to reflect new queue depth
    */
   broadcastSummarizeQueued(): void {
-    // Update processing status (queue depth changed)
-    this.workerService.broadcastProcessingStatus();
+    try {
+      (this.workerService as any)?.broadcastProcessingStatus?.();
+    } catch (error) {
+      logger.warn('SSE', 'broadcastProcessingStatus failed during summarize queue broadcast', {}, error as Error);
+    }
   }
 }
