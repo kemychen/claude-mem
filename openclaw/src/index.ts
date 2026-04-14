@@ -1203,14 +1203,20 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
   api.registerMemoryCorpusSupplement({
     async search(params) {
       const limit = params.maxResults ?? 10;
+      api.logger.info(`[claude-mem] corpus-supplement search: query="${params.query.slice(0, 80)}" maxResults=${limit}`);
+      const searchStart = Date.now();
       const data = await workerGetJson(
         workerPort,
         `/api/search?query=${encodeURIComponent(params.query)}&type=observations&format=json&limit=${limit}`,
         api.logger,
       );
-      if (!data) return [];
+      if (!data) {
+        api.logger.warn(`[claude-mem] corpus-supplement search: worker returned null (${Date.now() - searchStart}ms)`);
+        return [];
+      }
 
       const observations = Array.isArray(data.observations) ? data.observations : [];
+      api.logger.info(`[claude-mem] corpus-supplement search: ${observations.length} results (${Date.now() - searchStart}ms)`);
       return observations.map((obs: any) => {
         const title = obs.title || obs.subtitle || "Observation";
         const snippet = obs.narrative || obs.text || obs.facts || "";
@@ -1230,15 +1236,23 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
       });
     },
     async get(params) {
+      api.logger.info(`[claude-mem] corpus-supplement get: lookup="${params.lookup.slice(0, 80)}"`);
+      const getStart = Date.now();
       const data = await workerGetJson(
         workerPort,
         `/api/search?query=${encodeURIComponent(params.lookup)}&type=observations&format=json&limit=1`,
         api.logger,
       );
-      if (!data) return null;
+      if (!data) {
+        api.logger.warn(`[claude-mem] corpus-supplement get: worker returned null (${Date.now() - getStart}ms)`);
+        return null;
+      }
 
       const observations = Array.isArray(data.observations) ? data.observations : [];
-      if (observations.length === 0) return null;
+      if (observations.length === 0) {
+        api.logger.info(`[claude-mem] corpus-supplement get: no match found (${Date.now() - getStart}ms)`);
+        return null;
+      }
 
       const obs = observations[0] as any;
       const parts: string[] = [];

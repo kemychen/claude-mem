@@ -105,6 +105,16 @@ export class OpenAICompatibleAgent {
     const config = getCustomProviderConfig();
     const { label, apiKey, model, baseUrl } = config;
 
+    logger.info('SESSION', `[${label}] Starting session`, {
+      sessionDbId: session.sessionDbId,
+      project: session.project,
+      model,
+      baseUrl: baseUrl.replace(/\/\/([^:]+):([^@]+)@/, '//$1:***@'),  // mask credentials in URL
+      hasApiKey: !!apiKey,
+      maxContextMessages: config.maxContextMessages,
+      maxEstimatedTokens: config.maxEstimatedTokens,
+    });
+
     if (!apiKey) {
       throw new Error(`Custom provider API key not configured. Set CLAUDE_MEM_CUSTOM_API_KEY in settings.`);
     }
@@ -129,6 +139,11 @@ export class OpenAICompatibleAgent {
         : buildContinuationPrompt(session.userPrompt, session.lastPromptNumber, session.contentSessionId, mode);
 
       session.conversationHistory.push({ role: 'user', content: initPrompt });
+      logger.debug('SESSION', `[${label}] Sending init prompt`, {
+        sessionDbId: session.sessionDbId,
+        promptNumber: session.lastPromptNumber,
+        historyLength: session.conversationHistory.length,
+      });
       const initResponse = await this.queryMultiTurn(session.conversationHistory, config);
 
       if (initResponse.content) {
@@ -153,6 +168,11 @@ export class OpenAICompatibleAgent {
         const originalTimestamp = session.earliestPendingTimestamp;
 
         if (message.type === 'observation') {
+          logger.debug('SESSION', `[${label}] Processing observation`, {
+            sessionDbId: session.sessionDbId,
+            toolName: message.tool_name,
+            promptNumber: message.prompt_number,
+          });
           if (message.prompt_number !== undefined) {
             session.lastPromptNumber = message.prompt_number;
           }
@@ -184,6 +204,10 @@ export class OpenAICompatibleAgent {
             worker, tokensUsed, originalTimestamp, label, lastCwd, model
           );
         } else if (message.type === 'summarize') {
+          logger.debug('SESSION', `[${label}] Processing summarize`, {
+            sessionDbId: session.sessionDbId,
+            memorySessionId: session.memorySessionId,
+          });
           if (!session.memorySessionId) {
             throw new Error('Cannot process summary: memorySessionId not yet captured.');
           }
@@ -293,6 +317,8 @@ export class OpenAICompatibleAgent {
       totalChars: truncatedHistory.reduce((sum, m) => sum + m.content.length, 0),
     });
 
+    const requestStart = Date.now();
+
     const headers: Record<string, string> = {
       'Authorization': `Bearer ${apiKey}`,
       'Content-Type': 'application/json',
@@ -312,6 +338,12 @@ export class OpenAICompatibleAgent {
 
     if (!response.ok) {
       const errorText = await response.text();
+      logger.error('SDK', `[${label}] API HTTP error`, {
+        status: response.status,
+        model,
+        elapsedMs: Date.now() - requestStart,
+        errorPreview: errorText.slice(0, 200),
+      });
       throw new Error(`${label} API error: ${response.status} - ${errorText}`);
     }
 
@@ -332,9 +364,10 @@ export class OpenAICompatibleAgent {
     if (tokensUsed) {
       const inputTokens = data.usage?.prompt_tokens || 0;
       const outputTokens = data.usage?.completion_tokens || 0;
-      logger.info('SDK', `${label} API usage`, {
+      logger.info('SDK', `[${label}] API usage`, {
         model, inputTokens, outputTokens, totalTokens: tokensUsed,
         messagesInContext: truncatedHistory.length,
+        elapsedMs: Date.now() - requestStart,
       });
 
       if (tokensUsed > 50000) {
@@ -364,9 +397,17 @@ export function getCustomProviderConfig(): OpenAICompatibleConfig {
   const model = settings.CLAUDE_MEM_CUSTOM_MODEL || 'gpt-4o-mini';
   const label = settings.CLAUDE_MEM_CUSTOM_LABEL || 'Custom';
 
-  // Parse optional max context settings
   const maxContextMessages = parseInt(settings.CLAUDE_MEM_CUSTOM_MAX_CONTEXT_MESSAGES) || DEFAULT_MAX_CONTEXT_MESSAGES;
   const maxEstimatedTokens = parseInt(settings.CLAUDE_MEM_CUSTOM_MAX_TOKENS) || DEFAULT_MAX_ESTIMATED_TOKENS;
+
+  logger.debug('SDK', `[CustomProvider] Config loaded`, {
+    label,
+    baseUrl: baseUrl ? baseUrl.replace(/\/\/([^:]+):([^@]+)@/, '//$1:***@') : '(not set)',
+    model,
+    hasApiKey: !!apiKey,
+    maxContextMessages,
+    maxEstimatedTokens,
+  });
 
   return { label, baseUrl, apiKey, model, maxContextMessages, maxEstimatedTokens };
 }
