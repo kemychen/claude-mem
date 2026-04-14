@@ -131,9 +131,56 @@ interface OpenClawPluginApi {
       ((event: "message_received", callback: MessageEventCallback<MessageReceivedEvent>) => void) &
       ((event: "after_compaction", callback: EventCallback<AfterCompactionEvent>) => void) &
       ((event: "gateway_start", callback: EventCallback<Record<string, never>>) => void);
+  registerMemoryCorpusSupplement: (supplement: MemoryCorpusSupplement) => void;
   runtime: {
     channel: Record<string, Record<string, (...args: any[]) => Promise<any>>>;
   };
+}
+
+// ============================================================================
+// Memory Corpus Supplement Types (matches OpenClaw Plugin SDK)
+// ============================================================================
+
+interface MemoryCorpusSearchResult {
+  corpus: string;
+  path: string;
+  title?: string;
+  kind?: string;
+  score: number;
+  snippet: string;
+  id?: string;
+  source?: string;
+  provenanceLabel?: string;
+  sourceType?: string;
+  updatedAt?: string;
+}
+
+interface MemoryCorpusGetResult {
+  corpus: string;
+  path: string;
+  title?: string;
+  kind?: string;
+  content: string;
+  fromLine: number;
+  lineCount: number;
+  id?: string;
+  provenanceLabel?: string;
+  sourceType?: string;
+  updatedAt?: string;
+}
+
+interface MemoryCorpusSupplement {
+  search(params: {
+    query: string;
+    maxResults?: number;
+    agentSessionKey?: string;
+  }): Promise<MemoryCorpusSearchResult[]>;
+  get(params: {
+    lookup: string;
+    fromLine?: number;
+    lineCount?: number;
+    agentSessionKey?: string;
+  }): Promise<MemoryCorpusGetResult | null>;
 }
 
 // ============================================================================
@@ -1145,6 +1192,92 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
       }
     },
   });
+
+  // ------------------------------------------------------------------
+  // Memory Corpus Supplement — expose claude-mem knowledge to memory_search/memory_get
+  // Requires OpenClaw 2026.4.10+ (registerMemoryCorpusSupplement API)
+  // ------------------------------------------------------------------
+  if (typeof api.registerMemoryCorpusSupplement !== "function") {
+    api.logger.info("[claude-mem] Memory corpus supplement not available (OpenClaw version too old, requires 2026.4.10+)");
+  } else {
+  api.registerMemoryCorpusSupplement({
+    async search(params) {
+      const limit = params.maxResults ?? 10;
+      const data = await workerGetJson(
+        workerPort,
+        `/api/search?query=${encodeURIComponent(params.query)}&type=observations&format=json&limit=${limit}`,
+        api.logger,
+      );
+      if (!data) return [];
+
+      const observations = Array.isArray(data.observations) ? data.observations : [];
+      return observations.map((obs: any) => {
+        const title = obs.title || obs.subtitle || "Observation";
+        const snippet = obs.narrative || obs.text || obs.facts || "";
+        return {
+          corpus: "claude-mem",
+          path: `claude-mem://observation/${obs.id ?? "unknown"}`,
+          title,
+          kind: obs.type || "observation",
+          score: typeof obs.score === "number" ? obs.score : 0.5,
+          snippet: typeof snippet === "string" ? snippet.slice(0, 500) : String(snippet).slice(0, 500),
+          id: obs.id != null ? String(obs.id) : undefined,
+          source: "claude-mem",
+          provenanceLabel: "Claude-Mem",
+          sourceType: "plugin",
+          updatedAt: obs.created_at,
+        } as MemoryCorpusSearchResult;
+      });
+    },
+    async get(params) {
+      const data = await workerGetJson(
+        workerPort,
+        `/api/search?query=${encodeURIComponent(params.lookup)}&type=observations&format=json&limit=1`,
+        api.logger,
+      );
+      if (!data) return null;
+
+      const observations = Array.isArray(data.observations) ? data.observations : [];
+      if (observations.length === 0) return null;
+
+      const obs = observations[0] as any;
+      const parts: string[] = [];
+      if (obs.title) parts.push(`# ${obs.title}`);
+      if (obs.subtitle) parts.push(obs.subtitle);
+      if (obs.narrative) parts.push(obs.narrative);
+      if (obs.text && obs.text !== obs.narrative) parts.push(obs.text);
+      if (obs.facts) {
+        try {
+          const facts = JSON.parse(obs.facts);
+          if (Array.isArray(facts)) parts.push("\nFacts:\n" + facts.map((f: string) => `- ${f}`).join("\n"));
+        } catch { /* ignore parse errors */ }
+      }
+      if (obs.concepts) {
+        try {
+          const concepts = JSON.parse(obs.concepts);
+          if (Array.isArray(concepts)) parts.push("\nConcepts: " + concepts.join(", "));
+        } catch { /* ignore parse errors */ }
+      }
+      const content = parts.join("\n\n");
+      const lines = content.split("\n");
+
+      return {
+        corpus: "claude-mem",
+        path: `claude-mem://observation/${obs.id ?? "unknown"}`,
+        title: obs.title || "Observation",
+        kind: obs.type || "observation",
+        content,
+        fromLine: params.fromLine ?? 1,
+        lineCount: lines.length,
+        id: obs.id != null ? String(obs.id) : undefined,
+        provenanceLabel: "Claude-Mem",
+        sourceType: "plugin",
+        updatedAt: obs.created_at,
+      } as MemoryCorpusGetResult;
+    },
+  });
+  api.logger.info("[claude-mem] Registered memory corpus supplement — memory_search/memory_get now include claude-mem observations");
+  } // end registerMemoryCorpusSupplement guard
 
   api.logger.info(`[claude-mem] OpenClaw plugin loaded — v1.0.0 (worker: ${_workerHost}:${workerPort})`);
 }
