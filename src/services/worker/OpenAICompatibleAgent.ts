@@ -107,6 +107,22 @@ export interface OpenAICompatibleConfig {
   maxEstimatedTokens?: number;
 }
 
+/**
+ * Normalize a model response: if the content has no XML tags at all, the model
+ * chose to skip recording (valid behaviour). Synthesize the appropriate skip tag
+ * so the parser marks the message as completed rather than failed.
+ */
+function normalizeResponseContent(content: string, messageType: 'observation' | 'summary'): string {
+  if (!content.trim()) return content;
+  // If response already has XML tags, pass through as-is
+  if (/<[a-zA-Z]/.test(content)) return content;
+  // Plain text = model decided nothing to record
+  logger.info('SDK', `Model returned plain text for ${messageType} — treating as intentional skip`, {
+    preview: content.slice(0, 100),
+  });
+  return `<skip_summary reason="no work to record"/>`;
+}
+
 export class OpenAICompatibleAgent {
   private dbManager: DatabaseManager;
   private sessionManager: SessionManager;
@@ -233,7 +249,7 @@ export class OpenAICompatibleAgent {
           }
 
           await processAgentResponse(
-            obsResponse.content || '', session, this.dbManager, this.sessionManager,
+            normalizeResponseContent(obsResponse.content || '', 'observation'), session, this.dbManager, this.sessionManager,
             worker, tokensUsed, originalTimestamp, label, lastCwd, model
           );
         } else if (message.type === 'summarize') {
@@ -264,7 +280,7 @@ export class OpenAICompatibleAgent {
           }
 
           await processAgentResponse(
-            summaryResponse.content || '', session, this.dbManager, this.sessionManager,
+            normalizeResponseContent(summaryResponse.content || '', 'summary'), session, this.dbManager, this.sessionManager,
             worker, tokensUsed, originalTimestamp, label, lastCwd, model
           );
         }
