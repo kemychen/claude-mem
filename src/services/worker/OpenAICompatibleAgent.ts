@@ -1,21 +1,21 @@
 /**
- * OpenAICompatibleAgent: Generic agent for any OpenAI-compatible API endpoint.
+ * OpenAICompatibleAgent: Generic agent for any OpenAI-compatible OR Anthropic endpoint.
  *
  * Supports MiniMax, DeepSeek, Moonshot, Qwen, and any provider that implements
- * the OpenAI chat/completions API contract.
+ * the OpenAI chat/completions API contract, as well as Anthropic-format endpoints
+ * (e.g. MiniMax's /anthropic/v1/messages).
  *
  * Configuration via claude-mem settings:
- *   CLAUDE_MEM_PROVIDER       = "custom"
- *   CLAUDE_MEM_CUSTOM_BASE_URL  = "https://api.minimax.io/v1/chat/completions"
- *   CLAUDE_MEM_CUSTOM_API_KEY   = "sk-..."
- *   CLAUDE_MEM_CUSTOM_MODEL     = "MiniMax-M2.7"
- *   CLAUDE_MEM_CUSTOM_LABEL     = "MiniMax"  (optional, for logs)
+ *   CLAUDE_MEM_PROVIDER          = "custom"
+ *   CLAUDE_MEM_CUSTOM_BASE_URL   = "https://api.minimax.io/v1/chat/completions"
+ *                               OR "https://api.minimax.io/anthropic/v1/messages"
+ *   CLAUDE_MEM_CUSTOM_API_KEY    = "sk-..."
+ *   CLAUDE_MEM_CUSTOM_MODEL      = "MiniMax-M2.7"
+ *   CLAUDE_MEM_CUSTOM_LABEL      = "MiniMax"  (optional, for logs)
  *
- * Responsibility:
- * - Call OpenAI-compatible REST API for observation extraction
- * - Parse XML responses (same format as Claude/Gemini/OpenRouter)
- * - Sync to database and Chroma
- * - Support any OpenAI chat/completions endpoint
+ * Format auto-detection:
+ *   - URL contains "/anthropic" or ends with "/messages" (no "completions") → Anthropic format
+ *   - Otherwise → OpenAI format
  */
 
 import { buildContinuationPrompt, buildInitPrompt, buildObservationPrompt, buildSummaryPrompt } from '../../sdk/prompts.js';
@@ -66,6 +66,26 @@ interface OpenAICompletionResponse {
   };
 }
 
+// Anthropic Messages API response format
+interface AnthropicMessage {
+  id?: string;
+  type?: string;
+  role?: string;
+  content?: Array<{
+    type: string;       // "text" | "thinking"
+    text?: string;
+    thinking?: string;
+  }>;
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+  };
+  error?: {
+    type?: string;
+    message?: string;
+  };
+}
+
 /**
  * Configuration for an OpenAI-compatible provider instance.
  * Can be constructed from settings (custom provider) or hardcoded (preset).
@@ -101,15 +121,28 @@ export class OpenAICompatibleAgent {
     this.fallbackAgent = agent;
   }
 
+  /**
+   * Detect whether the endpoint uses OpenAI or Anthropic request/response format.
+   * Anthropic format: URL contains "/anthropic" or ends with "/messages" (no "completions").
+   */
+  private detectFormat(baseUrl: string): 'openai' | 'anthropic' {
+    if (baseUrl.includes('/anthropic') || (baseUrl.includes('/messages') && !baseUrl.includes('completions'))) {
+      return 'anthropic';
+    }
+    return 'openai';
+  }
+
   async startSession(session: ActiveSession, worker?: WorkerRef): Promise<void> {
     const config = getCustomProviderConfig();
     const { label, apiKey, model, baseUrl } = config;
+    const format = this.detectFormat(baseUrl);
 
     logger.info('SESSION', `[${label}] Starting session`, {
       sessionDbId: session.sessionDbId,
       project: session.project,
       model,
-      baseUrl: baseUrl.replace(/\/\/([^:]+):([^@]+)@/, '//$1:***@'),  // mask credentials in URL
+      baseUrl: baseUrl.replace(/\/\/([^:]+):([^@]+)@/, '//$1:***@'),
+      format,
       hasApiKey: !!apiKey,
       maxContextMessages: config.maxContextMessages,
       maxEstimatedTokens: config.maxEstimatedTokens,
@@ -304,38 +337,95 @@ export class OpenAICompatibleAgent {
     }));
   }
 
+  /**
+   * Convert conversation history to Anthropic messages format.
+   * Anthropic requires alternating user/assistant roles starting with user.
+   * System messages are returned separately.
+   */
+  private conversationToAnthropicMessages(history: ConversationMessage[]): {
+    messages: Array<{ role: 'user' | 'assistant'; content: string }>;
+    system?: string;
+  } {
+    const system: string[] = [];
+    const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+
+    for (const msg of history) {
+      if (msg.role === 'system') {
+        system.push(msg.content);
+      } else {
+        messages.push({
+          role: msg.role === 'assistant' ? 'assistant' : 'user',
+          content: msg.content,
+        });
+      }
+    }
+
+    // Ensure messages start with 'user' (Anthropic requirement)
+    while (messages.length > 0 && messages[0].role !== 'user') {
+      messages.shift();
+    }
+
+    return {
+      messages,
+      system: system.length > 0 ? system.join('\n\n') : undefined,
+    };
+  }
+
   private async queryMultiTurn(
     history: ConversationMessage[],
     config: OpenAICompatibleConfig,
     retryCount = 0,
   ): Promise<{ content: string; tokensUsed?: number }> {
     const { label, baseUrl, apiKey, model, extraHeaders } = config;
+    const format = this.detectFormat(baseUrl);
     const truncatedHistory = this.truncateHistory(history, config);
-    const messages = this.conversationToOpenAIMessages(truncatedHistory);
 
-    logger.debug('SDK', `Querying ${label} multi-turn (${model})`, {
+    logger.debug('SDK', `Querying ${label} multi-turn (${model}) [${format}]`, {
       turns: truncatedHistory.length,
       totalChars: truncatedHistory.reduce((sum, m) => sum + m.content.length, 0),
     });
 
     const requestStart = Date.now();
 
-    const headers: Record<string, string> = {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-      ...extraHeaders,
-    };
+    // Build headers and body based on format
+    let headers: Record<string, string>;
+    let body: string;
 
-    const response = await fetch(baseUrl, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
+    if (format === 'anthropic') {
+      headers = {
+        'x-api-key': apiKey,
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'anthropic-version': '2023-06-01',
+        ...extraHeaders,
+      };
+      const { messages, system } = this.conversationToAnthropicMessages(truncatedHistory);
+      const anthropicBody: Record<string, unknown> = {
+        model,
+        max_tokens: 4096,
+        messages,
+      };
+      if (system) {
+        anthropicBody.system = system;
+      }
+      body = JSON.stringify(anthropicBody);
+    } else {
+      // OpenAI format
+      headers = {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        ...extraHeaders,
+      };
+      const messages = this.conversationToOpenAIMessages(truncatedHistory);
+      body = JSON.stringify({
         model,
         messages,
         temperature: 0.3,
         max_tokens: 4096,
-      }),
-    });
+      });
+    }
+
+    const response = await fetch(baseUrl, { method: 'POST', headers, body });
 
     if (!response.ok) {
       const errorText = await response.text();
@@ -365,41 +455,78 @@ export class OpenAICompatibleAgent {
       throw new Error(`${label} API error: ${response.status} - ${errorText}`);
     }
 
-    const data = await response.json() as OpenAICompletionResponse;
+    // Parse response based on format
+    if (format === 'anthropic') {
+      const data = await response.json() as AnthropicMessage;
 
-    if (data.error) {
-      throw new Error(`${label} API error: ${data.error.code || data.error.type} - ${data.error.message}`);
-    }
-
-    if (!data.choices?.[0]?.message?.content) {
-      logger.error('SDK', `Empty response from ${label}`);
-      return { content: '' };
-    }
-
-    const content = data.choices[0].message.content;
-
-    // Strip <think>...</think> blocks that some models (e.g. MiniMax) include
-    // before their actual response — the parser only looks for XML tags like
-    // <observation> and <summary>, so thinking blocks would cause false "non-XML"
-    // discards.
-    const strippedContent = content.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
-    const tokensUsed = data.usage?.total_tokens;
-
-    if (tokensUsed) {
-      const inputTokens = data.usage?.prompt_tokens || 0;
-      const outputTokens = data.usage?.completion_tokens || 0;
-      logger.info('SDK', `[${label}] API usage`, {
-        model, inputTokens, outputTokens, totalTokens: tokensUsed,
-        messagesInContext: truncatedHistory.length,
-        elapsedMs: Date.now() - requestStart,
-      });
-
-      if (tokensUsed > 50000) {
-        logger.warn('SDK', `High token usage on ${label}`, { totalTokens: tokensUsed });
+      if (data.error) {
+        throw new Error(`${label} API error: ${data.error.type} - ${data.error.message}`);
       }
-    }
 
-    return { content: strippedContent, tokensUsed };
+      // Extract text content blocks (skip thinking blocks)
+      const textContent = (data.content || [])
+        .filter(block => block.type === 'text')
+        .map(block => block.text || '')
+        .join('');
+
+      if (!textContent) {
+        logger.error('SDK', `Empty response from ${label} (Anthropic format)`);
+        return { content: '' };
+      }
+
+      const inputTokens = data.usage?.input_tokens || 0;
+      const outputTokens = data.usage?.output_tokens || 0;
+      const tokensUsed = inputTokens + outputTokens;
+
+      if (tokensUsed > 0) {
+        logger.info('SDK', `[${label}] API usage`, {
+          model, inputTokens, outputTokens, totalTokens: tokensUsed,
+          messagesInContext: truncatedHistory.length,
+          elapsedMs: Date.now() - requestStart,
+          format: 'anthropic',
+        });
+        if (tokensUsed > 50000) {
+          logger.warn('SDK', `High token usage on ${label}`, { totalTokens: tokensUsed });
+        }
+      }
+
+      return { content: textContent, tokensUsed: tokensUsed || undefined };
+
+    } else {
+      // OpenAI format
+      const data = await response.json() as OpenAICompletionResponse;
+
+      if (data.error) {
+        throw new Error(`${label} API error: ${data.error.code || data.error.type} - ${data.error.message}`);
+      }
+
+      if (!data.choices?.[0]?.message?.content) {
+        logger.error('SDK', `Empty response from ${label} (OpenAI format)`);
+        return { content: '' };
+      }
+
+      const content = data.choices[0].message.content;
+
+      // Strip <think>...</think> blocks that some models (e.g. MiniMax) include
+      const strippedContent = content.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+      const tokensUsed = data.usage?.total_tokens;
+
+      if (tokensUsed) {
+        const inputTokens = data.usage?.prompt_tokens || 0;
+        const outputTokens = data.usage?.completion_tokens || 0;
+        logger.info('SDK', `[${label}] API usage`, {
+          model, inputTokens, outputTokens, totalTokens: tokensUsed,
+          messagesInContext: truncatedHistory.length,
+          elapsedMs: Date.now() - requestStart,
+          format: 'openai',
+        });
+        if (tokensUsed > 50000) {
+          logger.warn('SDK', `High token usage on ${label}`, { totalTokens: tokensUsed });
+        }
+      }
+
+      return { content: strippedContent, tokensUsed };
+    }
   }
 }
 
