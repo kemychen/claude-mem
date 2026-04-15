@@ -377,6 +377,12 @@ export class OpenAICompatibleAgent {
     }
 
     const content = data.choices[0].message.content;
+
+    // Strip <think>...</think> blocks that some models (e.g. MiniMax) include
+    // before their actual response — the parser only looks for XML tags like
+    // <observation> and <summary>, so thinking blocks would cause false "non-XML"
+    // discards.
+    const strippedContent = content.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
     const tokensUsed = data.usage?.total_tokens;
 
     if (tokensUsed) {
@@ -393,7 +399,7 @@ export class OpenAICompatibleAgent {
       }
     }
 
-    return { content, tokensUsed };
+    return { content: strippedContent, tokensUsed };
   }
 }
 
