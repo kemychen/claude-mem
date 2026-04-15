@@ -84,6 +84,12 @@ elif [[ -d "$EXTENSION_DIR/openclaw/dist" ]]; then
   cp -f "$FORK_DIR/openclaw/dist/index.js" "$EXTENSION_DIR/openclaw/dist/index.js"
 fi
 
+log "Copying openclaw skills..."
+if [[ -d "$FORK_DIR/openclaw/skills" ]]; then
+  cp -r "$FORK_DIR/openclaw/skills" "$EXTENSION_DIR/"
+  log "Skills copied: $(ls "$EXTENSION_DIR/skills" | tr '\n' ' ')"
+fi
+
 # ============================================================================
 # Step 4: Fix openclaw.plugin.json (remove kind: "memory" if present)
 # ============================================================================
