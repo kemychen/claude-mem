@@ -219,17 +219,58 @@ curl -s 'http://127.0.0.1:37777/api/search?query=test&type=observations&format=j
 
 ---
 
-## 三、部署检查清单
+## 三、一键部署脚本
+
+使用 `scripts/deploy-to-openclaw.sh` 可一键完成部署，自动处理所有已知陷阱：
+
+```bash
+# 首次部署（或代码更新后）
+bash ~/claude-mem-fork/scripts/deploy-to-openclaw.sh
+
+# 跳过构建（仅重新部署已构建的产物）
+bash ~/claude-mem-fork/scripts/deploy-to-openclaw.sh --skip-build
+
+# 不重启 openclaw gateway
+bash ~/claude-mem-fork/scripts/deploy-to-openclaw.sh --skip-openclaw-restart
+```
+
+脚本自动完成：
+1. `git pull` + `npm run build`
+2. 杀掉旧 worker 进程
+3. 复制 worker-service.cjs、mcp-server.cjs、openclaw plugin dist/index.js
+4. 修复 `openclaw.plugin.json`（移除 `kind: "memory"` 避免插件不加载）
+5. 修复 `openclaw.json`（确保 `slots.memory = memory-core`，claude-mem 和 memory-core 都启用）
+6. 等待 worker 自动重启并验证
+7. 重启 openclaw gateway
+8. 自动验证：worker health、gateway 插件列表、corpus supplement 注册、数据库计数
+
+## 四、部署已知陷阱
+
+以下问题在部署脚本中已自动处理，供手动部署时参考：
+
+| 陷阱 | 说明 | 自动修复 |
+|------|------|---------|
+| `kind: "memory"` 导致插件不加载 | openclaw 的 `kind=memory` 插件只在占 memory slot 时才加载，但 slot 要给 memory-core | 脚本自动删除 kind 字段 |
+| `plugins.slots.memory` 被抢 | 官方安装脚本会把 slot 改成 claude-mem | 脚本自动改回 memory-core |
+| SettingsRoutes 校验白名单 | settings API 拒绝 `custom` provider | fork 已修复（SettingsRoutes.ts） |
+| SettingsDefaultsManager 缺字段 | CUSTOM_* 字段不在 DEFAULTS 里导致读不到 | fork 已修复（SettingsDefaultsManager.ts） |
+| bun 缓存旧 worker 文件 | openclaw 用 bun 管理 worker，文件更新后 bun 可能用缓存 | 脚本先 kill 再 cp |
+| non-XML 响应被标记 failed | MiniMax 选择不记录时输出纯文字 | fork 已修复（normalizeResponseContent） |
+
+## 五、部署检查清单
 
 部署后按顺序验证：
 
 - [ ] `npm run build` 构建成功
 - [ ] claude-mem worker 正常运行：`curl http://127.0.0.1:37777/api/health`
-- [ ] OpenClaw 重启后 claude-mem 插件加载成功（检查日志）
-- [ ] `corpus-supplement` 注册日志出现
-- [ ] `memory_search` 能返回 claude-mem 的 observations
-- [ ] （如使用自定义 provider）settings 中 CLAUDE_MEM_PROVIDER=custom 已设置
-- [ ] （如使用自定义 provider）日志中出现 `[Label] Starting session` 和 `[Label] agent completed`
+- [ ] health 中 provider 显示 `custom`（如使用自定义 provider）
+- [ ] OpenClaw 重启后 claude-mem 插件加载成功：日志中 `ready (N plugins: ... claude-mem ...)`
+- [ ] corpus supplement 注册日志出现：`Registered memory corpus supplement`
+- [ ] `openclaw.plugin.json` 中没有 `kind: "memory"`
+- [ ] `openclaw.json` 中 `plugins.slots.memory = "memory-core"`
+- [ ] 在 Discord 调用 `memory_search(corpus="wiki")` 能返回 claude-mem observations
+- [ ] 日志中无 500 错误或持续 failed 消息
+- [ ] `pending_messages` 中 failed 为 0
 - [ ] （如使用自定义 provider）observations 数量增长，pending 队列正常消费
 
 ## 四、相关文件
