@@ -307,6 +307,7 @@ export class OpenAICompatibleAgent {
   private async queryMultiTurn(
     history: ConversationMessage[],
     config: OpenAICompatibleConfig,
+    retryCount = 0,
   ): Promise<{ content: string; tokensUsed?: number }> {
     const { label, baseUrl, apiKey, model, extraHeaders } = config;
     const truncatedHistory = this.truncateHistory(history, config);
@@ -338,10 +339,27 @@ export class OpenAICompatibleAgent {
 
     if (!response.ok) {
       const errorText = await response.text();
+      const elapsedMs = Date.now() - requestStart;
+      // Retry on 5xx (server-side transient errors) up to 3 times with backoff
+      const isTransient = response.status >= 500 && response.status < 600;
+      const maxRetries = 3;
+      if (isTransient && retryCount < maxRetries) {
+        const backoffMs = Math.min(1000 * Math.pow(2, retryCount), 8000);
+        logger.warn('SDK', `[${label}] API ${response.status} error, retrying in ${backoffMs}ms`, {
+          status: response.status,
+          model,
+          elapsedMs,
+          attempt: retryCount + 1,
+          maxRetries,
+          errorPreview: errorText.slice(0, 100),
+        });
+        await new Promise(resolve => setTimeout(resolve, backoffMs));
+        return this.queryMultiTurn(history, config, retryCount + 1);
+      }
       logger.error('SDK', `[${label}] API HTTP error`, {
         status: response.status,
         model,
-        elapsedMs: Date.now() - requestStart,
+        elapsedMs,
         errorPreview: errorText.slice(0, 200),
       });
       throw new Error(`${label} API error: ${response.status} - ${errorText}`);
